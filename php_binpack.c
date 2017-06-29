@@ -27,7 +27,12 @@
 #include "zend_exceptions.h"
 
 #include "ext/standard/info.h"
+
+#if PHP_MAJOR_VERSION >= 7
+#include "ext/standard/php_smart_string.h"			/* for smart_str */
+#else
 #include "ext/standard/php_smart_str.h"			/* for smart_str */
+#endif
 
 #include "php_binpack.h"
 #include "bin_pack.h"
@@ -195,7 +200,7 @@ static inline char *_itoa(char *bufend, uintmax_t value)
 		return bufend;
 }
 
-inline static int binpack_check_ht_is_map(zval *array TSRMLS_DC) 
+inline static int binpack_check_ht_is_map(zval *array TSRMLS_DC)
 {
 	HashTable *ht = Z_ARRVAL_P(array);
     int count = zend_hash_num_elements(ht);
@@ -219,12 +224,23 @@ inline static int binpack_check_ht_is_map(zval *array TSRMLS_DC)
 
 static ssize_t binpack_write_buffer(void *buf, const void *data, size_t len)
 {
+#if PHP_MAJOR_VERSION >= 7
+	smart_string *str = (smart_string *)buf;
+	if (len == 1)
+		smart_string_appendc(str, *(char *)data);
+	else
+		smart_string_appendl(str, data, len);
+	return len;
+#else
 	smart_str *str = (smart_str *)buf;
 	if (len == 1)
 		smart_str_appendc(str, *(char *)data);
 	else
 		smart_str_appendl(str, data, len);
 	return len;
+#endif
+
+
 }
 
 static void binpack_encode_array(bin_packer_t *pk, zval *arr TSRMLS_DC)
@@ -241,6 +257,75 @@ static void binpack_encode_array(bin_packer_t *pk, zval *arr TSRMLS_DC)
 		is_dict = true;
 	}
 
+#if PHP_MAJOR_VERSION >= 7
+	if (ht->arData->nApplyCount > 1)
+	{
+		php_error_docref(NULL TSRMLS_CC, E_RECOVERABLE_ERROR, "[binpack] (binpack_encode_array) circular references is unsupported");
+		bin_pack_null(pk);
+		return;
+	}
+
+	ht->arData->nApplyCount++;
+
+	num = ht ? zend_hash_num_elements(ht) : 0;
+
+	if (is_dict)
+		bin_pack_open_dict(pk);
+	else
+		bin_pack_open_list(pk);
+
+	if (num > 0)
+	{
+		ulong idx;
+		char *key;
+		uint key_len;
+		HashPosition pos;
+		HashTable *tmp_ht;
+		zval **data;
+
+		zend_hash_internal_pointer_reset_ex(ht, &pos);
+		for (; true; zend_hash_move_forward_ex(ht, &pos))
+		{
+			int x = zend_hash_get_current_key_ex(ht, &key, &key_len, &idx, 0, &pos);
+			if (x == HASH_KEY_NON_EXISTANT)
+				break;
+			if (zend_hash_get_current_data_ex(ht, (void **) &data, &pos) != SUCCESS)
+				continue;
+
+			tmp_ht = HASH_OF(*data);
+			if (tmp_ht)
+				tmp_ht->arData->nApplyCount++;
+
+			if (is_dict)
+			{
+				if (x == HASH_KEY_IS_STRING)
+				{
+					if (key[0] == '\0' && Z_TYPE_P(arr) == IS_OBJECT)
+					{
+						/* Skip protected and private members. */
+						if (tmp_ht)
+							tmp_ht->arData->nApplyCount--;
+						continue;
+					}
+					/* The key length including the trailing NUL character. */
+					bin_pack_lstring(pk, key, (key_len - 1));
+				}
+				else
+				{
+					bin_pack_integer(pk, (long)idx);
+				}
+			}
+
+			binpack_do_encode(pk, *data TSRMLS_CC);
+
+			if (tmp_ht)
+				tmp_ht->arDatanApplyCount--;
+		}
+	}
+	bin_pack_closure(pk);
+
+	ht->nApplyCount--;
+#else
 	if (ht->nApplyCount > 1)
 	{
 		php_error_docref(NULL TSRMLS_CC, E_RECOVERABLE_ERROR, "[binpack] (binpack_encode_array) circular references is unsupported");
@@ -272,7 +357,6 @@ static void binpack_encode_array(bin_packer_t *pk, zval *arr TSRMLS_DC)
 			int x = zend_hash_get_current_key_ex(ht, &key, &key_len, &idx, 0, &pos);
 			if (x == HASH_KEY_NON_EXISTANT)
 				break;
-
 			if (zend_hash_get_current_data_ex(ht, (void **) &data, &pos) != SUCCESS)
 				continue;
 
@@ -309,6 +393,8 @@ static void binpack_encode_array(bin_packer_t *pk, zval *arr TSRMLS_DC)
 	bin_pack_closure(pk);
 
 	ht->nApplyCount--;
+#endif
+
 }
 
 static bool binpack_make_list(bin_unpacker_t *uk, zval *val TSRMLS_DC)
@@ -417,10 +503,11 @@ static void binpack_do_encode(bin_packer_t *pk, zval *val TSRMLS_DC)
 		case IS_LONG:
 			bin_pack_integer(pk, Z_LVAL_P(val));
 			break;
-
-		case IS_BOOL:
-			bin_pack_bool(pk, Z_BVAL_P(val));
-			break;
+#if PHP_MAJOR_VERSION < 7
+        case IS_BOOL:
+            bin_pack_bool(pk, Z_BVAL_P(val));
+            break;
+#endif
 
 		case IS_NULL:
 			bin_pack_null(pk);
@@ -491,20 +578,31 @@ static int binpack_do_decode(bin_unpacker_t *uk, zval **val TSRMLS_DC)
 				{
 					*--s = '-';
 				}
-				ZVAL_STRINGL(*val, s, end - s, 1);
-
+#if PHP_MAJOR_VERSION >= 7
+                ZVAL_STRINGL(*val, s, end - s);
+#else
+                ZVAL_STRINGL(*val, s, end - s, 1);
+#endif
 				type = BIN_TYPE_STRING;
 			}
 		}
 		else if (type == BIN_TYPE_STRING)
 		{
-			ZVAL_STRINGL(*val, uk->buf + uk->pos, num, 1);
+#if PHP_MAJOR_VERSION >= 7
+            ZVAL_STRINGL(*val, uk->buf + uk->pos, num);
+#else
+            ZVAL_STRINGL(*val, uk->buf + uk->pos, num, 1);
+#endif
 			uk->pos += num;
 		}
 		else if (type == BIN_TYPE_BLOB)
 		{
 			/* in php, blob is string */
-			ZVAL_STRINGL(*val, uk->buf + uk->pos, num, 1);
+#if PHP_MAJOR_VERSION >= 7
+            ZVAL_STRINGL(*val, uk->buf + uk->pos, num);
+#else
+            ZVAL_STRINGL(*val, uk->buf + uk->pos, num, 1);
+#endif
 			uk->pos += num;
 		}
 		else if (type == BIN_TYPE_BOOL || type == BIN_TYPE_BOOL_FALSE)
@@ -556,7 +654,12 @@ static int binpack_do_decode(bin_unpacker_t *uk, zval **val TSRMLS_DC)
 		return type;
 	}
 error:
-	FREE_ZVAL(*val);
+#if PHP_MAJOR_VERSION >= 7
+    free(*val);
+#else
+    FREE_ZVAL(*val);
+#endif
+
 	return -1;
 }
 
@@ -569,7 +672,11 @@ error:
 PHP_FUNCTION(bin_encode)
 {
 	zval *val;
+#if PHP_MAJOR_VERSION >= 7
+	smart_string buf = {0};
+#else
 	smart_str buf = {0};
+#endif
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &val) == FAILURE) {
 		return;
@@ -580,8 +687,13 @@ PHP_FUNCTION(bin_encode)
 
 	binpack_do_encode(&pk, val TSRMLS_CC);
 
-	ZVAL_STRINGL(return_value, buf.c, buf.len, 1);																  
+#if PHP_MAJOR_VERSION >= 7
+    ZVAL_STRINGL(return_value, buf.c, buf.len);
+	smart_string_free(&buf);
+#else
 	smart_str_free(&buf);
+    ZVAL_STRINGL(return_value, buf.c, buf.len, 1);
+#endif
 }
 /* }}} */
 /* 
@@ -618,7 +730,11 @@ PHP_FUNCTION(bin_decode)
 	{
 		*return_value = *ret;
 
-		FREE_ZVAL(ret);
+#if PHP_MAJOR_VERSION >= 7
+        free(ret);
+#else
+        FREE_ZVAL(ret);
+#endif
 	}
 }
 /* }}} */
